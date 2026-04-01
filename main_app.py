@@ -1,275 +1,360 @@
 """
 =============================================================================
-main_app.py
+main_app.py  —  Multi-Camera Pose Estimation Benchmarker
 =============================================================================
-Application principale PyQt5 pour la comparaison visuelle des 3 estimateurs
-de pose 2D sur le dataset Fit3D.
 
-Layout de la fenêtre :
-    ┌─────────────────────────────────────────────────────┐
-    │                 BARRE DE CONTRÔLE                   │
-    │  [Vidéo] [Ground Truth] [Calibration] [▶ Lancer]   │
-    ├────────────────────────────────────────┬────────────┤
-    │  SPLIT-SCREEN (3 panneaux côte à côte) │  GRAPHIQUES│
-    │  [BlazePose] [YOLO-Pose] [OpenPose]    │  - Courbe  │
-    │                                        │  - Barres  │
-    ├────────────────────────────────────────┤            │
-    │  TABLEAU DE MÉTRIQUES (mis à jour/30f) │            │
-    └────────────────────────────────────────┴────────────┘
+Flux utilisateur :
+    1. Charger vidéo + calibration pour chaque caméra (4 slots individuels).
+    2. La Ground Truth 2D est auto-détectée depuis le chemin vidéo
+       (structure Fit3D : s0X/joints3d_25/<exercice>.json) puis calculée
+       dès que la calibration est chargée.
+    3. Une preview de la 1ère frame s'affiche dans la grille.
+    4. L'évaluation lance 3 modèles × 4 caméras = 12 flux simultanés.
 
-Threading :
-    - L'inférence tourne dans un QThread séparé (EvaluationWorker)
-      pour ne pas bloquer l'UI.
-    - Les résultats sont envoyés via des signaux Qt (thread-safe).
-
+Layout :
+    ┌───────────────────────────────────────────────────────────────┐
+    │  SLOTS CAMÉRAS (4 colonnes)                                   │
+    │  [Cam1: vidéo+calib+GT]  ...  [Cam4: vidéo+calib+GT]  [▶]   │
+    ├──────────────────────────────────────────┬────────────────────┤
+    │  GRILLE 3×4 (BlazePose / YOLO / OpenPose)│  GRAPHIQUES        │
+    ├──────────────────────────────────────────┤                    │
+    │  TABLEAU DE MÉTRIQUES                    │                    │
+    └──────────────────────────────────────────┴────────────────────┘
 =============================================================================
 """
 
 import sys
 import os
-import time
 import cv2
 import numpy as np
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
-    QProgressBar, QSplitter, QFrame, QSizePolicy, QHeaderView,
-    QStatusBar, QGroupBox, QMessageBox
+    QProgressBar, QFrame, QSizePolicy, QHeaderView,
+    QGroupBox, QMessageBox, QGridLayout, QScrollArea
 )
-from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer
-)
-from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPalette
-)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
 
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
 
-# Modules locaux
-from pose_estimators import (
-    BlazePoseEstimator, YoloPoseEstimator, OpenPoseEstimator,
-    SKELETON_CONNECTIONS
-)
+from pose_estimators import BlazePoseEstimator, YoloPoseEstimator, OpenPoseEstimator
 from ground_truth import GroundTruthLoader, CameraCalibration
 from metrics import MetricsAccumulator
 from export_utils import save_csv, generate_pdf
 
 
 # =============================================================================
-# WORKER THREAD — Évaluation en arrière-plan
+# CONSTANTES
 # =============================================================================
 
-class EvaluationWorker(QThread):
+N_CAMS        = 1
+N_MODELS      = 3
+MODEL_NAMES   = ["BlazePose", "YOLO-Pose", "OpenPose"]
+MODEL_COLORS  = ["#00C853",   "#2196F3",   "#F44336"]
+CAM_LABELS    = ["Cam 1", "Cam 2", "Cam 3", "Cam 4"]
+
+
+# =============================================================================
+# AUTO-DÉTECTION DE LA GROUND TRUTH (structure Fit3D)
+# =============================================================================
+
+def auto_detect_gt(video_path: str) -> str | None:
     """
-    Thread d'évaluation indépendant de l'UI.
+    Déduit le chemin joints3d_25 depuis le chemin d'une vidéo Fit3D.
+    Structure : <subject>/videos/<cam_id>/<exercice>.mp4
+             → <subject>/joints3d_25/<exercice>.json
+    """
+    try:
+        exercise    = os.path.splitext(os.path.basename(video_path))[0]
+        cam_dir     = os.path.dirname(video_path)
+        videos_dir  = os.path.dirname(cam_dir)
+        subject_dir = os.path.dirname(videos_dir)
+        gt_path = os.path.join(subject_dir, "joints3d_25", f"{exercise}.json")
+        if os.path.isfile(gt_path):
+            return gt_path
+    except Exception:
+        pass
+    return None
 
-    Lit la vidéo frame par frame, applique les 3 estimateurs,
-    compare avec la GT, accumule les métriques, et émet des signaux
-    pour mettre à jour l'interface utilisateur.
 
-    Signaux émis :
-        frame_ready   : (frame_bp, frame_yolo, frame_op, frame_idx)
-                         — 3 images BGR annotées + index de frame
-        metrics_update: (summaries_dict, fps_dict, mpjpe_histories_dict)
-                         — mis à jour toutes les UPDATE_INTERVAL frames
-        finished_eval : (summaries_dict, fps_dict, mpjpe_histories_dict)
-                         — émis une fois l'évaluation terminée
-        progress      : (int, int) — frame_actuelle, total_frames
-        error_signal  : (str) — message d'erreur
+def extract_first_frame(video_path: str) -> np.ndarray | None:
+    """Extrait la première frame d'une vidéo pour la prévisualisation."""
+    cap = cv2.VideoCapture(video_path)
+    ret, frame = cap.read()
+    cap.release()
+    return frame if ret else None
+
+
+# =============================================================================
+# WORKER THREAD — Évaluation multi-caméras
+# =============================================================================
+
+class MultiCamEvaluationWorker(QThread):
+    """
+    Thread d'évaluation : 4 vidéos × 3 modèles = 12 flux annotés.
+
+    Signal frames_ready : list[12 frames BGR np.ndarray], frame_idx
+        Ordre : [model0_cam0, model0_cam1, …, model0_cam3,
+                 model1_cam0, …, model2_cam3]
     """
 
-    frame_ready    = pyqtSignal(object, object, object, int)
-    metrics_update = pyqtSignal(dict, dict, dict)
-    finished_eval  = pyqtSignal(dict, dict, dict)
-    progress       = pyqtSignal(int, int)
-    error_signal   = pyqtSignal(str)
+class SingleModelWorker(QThread):
+    frame_ready    = pyqtSignal(str, np.ndarray, int)     # model_name, frame, frame_idx
+    metrics_update = pyqtSignal(str, object, float, object)   # model_name, summary, fps, history
+    finished_eval  = pyqtSignal(str, object, float, object)   # model_name, summary, fps, history
+    progress       = pyqtSignal(str, int, int)            # model_name, current, total
+    error_signal   = pyqtSignal(str, str)                 # model_name, error_msg
 
-    UPDATE_INTERVAL = 30   # Mise à jour métriques toutes les N frames
+    UPDATE_INTERVAL = 30
 
-    def __init__(self, video_path: str, estimators: list,
-                 gt_loader: GroundTruthLoader, parent=None):
-        """
-        Paramètres :
-            video_path  : chemin vers la vidéo .mp4
-            estimators  : liste des 3 PoseEstimator instanciés
-            gt_loader   : instance GroundTruthLoader déjà chargée
-        """
+    def __init__(self, video_path: str, estimator, gt_loader, parent=None):
         super().__init__(parent)
-        self.video_path  = video_path
-        self.estimators  = estimators
-        self.gt_loader   = gt_loader
-        self._running    = True
+        self.video_path = video_path
+        self.estimator  = estimator
+        self.gt_loader  = gt_loader
+        self.model_name = estimator.model_name
+        self._running   = True
 
     def stop(self):
-        """Arrêt propre du thread depuis l'UI principale."""
         self._running = False
 
     def run(self):
-        """Boucle principale d'évaluation."""
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            self.error_signal.emit(f"Impossible d'ouvrir la vidéo : {self.video_path}")
+            self.error_signal.emit(self.model_name, f"Impossible d'ouvrir la vidéo: {self.video_path}")
             return
 
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # Accumulateurs de métriques (un par modèle)
-        accumulators = {est.model_name: MetricsAccumulator(est.model_name)
-                        for est in self.estimators}
+        total_frames = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        accumulator = MetricsAccumulator(self.model_name)
 
         frame_idx = 0
         while self._running:
             ret, frame = cap.read()
             if not ret:
                 break
+                
+            try:
+                keypoints = self.estimator.detect(frame)
+            except Exception as e:
+                print(f"Erreur inférence {self.model_name}: {e}")
+                keypoints = {}
 
-            # --- Ground Truth 2D pour cette frame ---
-            gt_2d     = self.gt_loader.get_gt_2d(frame_idx)
+            # Passer les keypoints à get_gt_2d pour alignement centroïdal
+            gt_2d = self.gt_loader.get_gt_2d(frame_idx, pred_keypoints=keypoints)
             bbox_size = self.gt_loader.compute_bbox_from_gt(gt_2d)
 
-            # --- Inférence des 3 modèles ---
-            annotated_frames = []
-            for est in self.estimators:
-                keypoints = est.detect(frame)
-                accumulators[est.model_name].update(keypoints, gt_2d, bbox_size)
+            accumulator.update(keypoints, gt_2d, bbox_size)
+            annotated = self.estimator.draw_skeleton(frame, keypoints, gt_2d)
+            
+            self.frame_ready.emit(self.model_name, annotated, frame_idx)
 
-                # Dessin du squelette + GT sur une copie de la frame
-                annotated = est.draw_skeleton(frame, keypoints, gt_2d)
-                annotated_frames.append(annotated)
-
-            # Émission des frames annotées vers l'UI
-            self.frame_ready.emit(
-                annotated_frames[0],   # BlazePose
-                annotated_frames[1],   # YOLO-Pose
-                annotated_frames[2],   # OpenPose
-                frame_idx
-            )
-
-            # --- Mise à jour métriques toutes les UPDATE_INTERVAL frames ---
             if frame_idx % self.UPDATE_INTERVAL == 0:
-                summaries = {m: accumulators[m].get_summary()
-                             for m in accumulators}
-                fps_dict  = {est.model_name: est.get_fps()
-                             for est in self.estimators}
-                histories = {m: accumulators[m].get_mpjpe_history()
-                             for m in accumulators}
-                self.metrics_update.emit(summaries, fps_dict, histories)
+                self.metrics_update.emit(
+                    self.model_name,
+                    accumulator.get_summary(),
+                    self.estimator.get_fps(),
+                    accumulator.get_mpjpe_history()
+                )
 
-            self.progress.emit(frame_idx + 1, total_frames)
-            frame_idx += 1
+            self.progress.emit(self.model_name, frame_idx + 1, total_frames)
+            
+            # x3 speed : skip 2 frames after each processed frame
+            cap.read()  # skip
+            cap.read()  # skip
+            frame_idx += 3
 
         cap.release()
-
-        # --- Résultats finaux ---
-        summaries = {m: accumulators[m].get_summary() for m in accumulators}
-        fps_dict  = {est.model_name: est.get_fps() for est in self.estimators}
-        histories = {m: accumulators[m].get_mpjpe_history() for m in accumulators}
-        self.finished_eval.emit(summaries, fps_dict, histories)
+        
+        self.finished_eval.emit(
+            self.model_name,
+            accumulator.get_summary(),
+            self.estimator.get_fps(),
+            accumulator.get_mpjpe_history()
+        )
 
 
 # =============================================================================
-# CANVAS MATPLOTLIB EMBARQUÉ
+# CANVAS MATPLOTLIB
 # =============================================================================
 
 class LiveChartCanvas(FigureCanvas):
-    """
-    Widget matplotlib intégré dans PyQt5 pour les graphiques en temps réel.
+    COLORS = {"BlazePose": "#00C853", "YOLO-Pose": "#2196F3", "OpenPose": "#F44336"}
 
-    Contient 2 sous-graphiques :
-        - Courbe MPJPE par frame (en haut)
-        - Barres MPJPE par modèle (en bas)
-    """
-
-    COLORS = {
-        "BlazePose": "#00C853",
-        "YOLO-Pose": "#2196F3",
-        "OpenPose":  "#F44336",
-    }
-
-    def __init__(self, parent=None, width=5, height=8, dpi=90):
-        self.fig = Figure(figsize=(width, height), dpi=dpi,
-                          facecolor='#1E1E2E')
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(10, 4), dpi=85, facecolor='#1E1E2E')
         super().__init__(self.fig)
         self.setParent(parent)
-
-        # Layout 2 lignes
-        gs = self.fig.add_gridspec(2, 1, hspace=0.45, top=0.93,
-                                   bottom=0.1, left=0.15, right=0.95)
+        gs = self.fig.add_gridspec(1, 2, wspace=0.3, top=0.85,
+                                   bottom=0.2, left=0.1, right=0.95)
         self.ax_curve = self.fig.add_subplot(gs[0])
         self.ax_bars  = self.fig.add_subplot(gs[1])
-
-        self._style_axes()
-
+        self._style()
         self.fig.suptitle("Métriques en temps réel", fontsize=10,
                           color='white', fontweight='bold')
 
-    def _style_axes(self):
-        """Applique un thème sombre aux axes."""
+    def _style(self):
         for ax in [self.ax_curve, self.ax_bars]:
             ax.set_facecolor('#2A2A3E')
-            ax.tick_params(colors='#AAAACC', labelsize=7)
+            ax.tick_params(colors='#AAAACC', labelsize=6)
             ax.spines[:].set_color('#444466')
-            for label in ax.get_xticklabels() + ax.get_yticklabels():
-                label.set_color('#AAAACC')
 
-    def update_charts(self, summaries: dict, fps_dict: dict,
-                      mpjpe_histories: dict):
-        """
-        Met à jour les deux graphiques avec les données les plus récentes.
-
-        Paramètres :
-            summaries       : dict {model_name: summary}
-            fps_dict        : dict {model_name: fps}
-            mpjpe_histories : dict {model_name: list[float]}
-        """
+    def update_charts(self, summaries, fps_dict, histories):
         self.ax_curve.cla()
         self.ax_bars.cla()
+        models = list(summaries.keys())
+        colors = [self.COLORS.get(m, '#AAAAAA') for m in models]
 
-        model_names = list(summaries.keys())
-        colors      = [self.COLORS.get(m, '#AAAAAA') for m in model_names]
-
-        # --- Courbe MPJPE par frame ---
-        for m, c in zip(model_names, colors):
-            hist = mpjpe_histories.get(m, [])
+        # Graphe gauche : évolution MPJPE par frame
+        for m, c in zip(models, colors):
+            hist = histories.get(m, [])
             if hist:
-                self.ax_curve.plot(hist, color=c, label=m,
-                                   linewidth=1.2, alpha=0.9)
-
-        self.ax_curve.set_title("MPJPE par frame", color='#CCCCEE',
-                                fontsize=8, pad=4)
-        self.ax_curve.set_xlabel("Frame", color='#AAAACC', fontsize=7)
-        self.ax_curve.set_ylabel("px", color='#AAAACC', fontsize=7)
-        self.ax_curve.legend(fontsize=6, facecolor='#2A2A3E',
+                self.ax_curve.plot(hist, color=c, label=m, linewidth=1.2)
+        self.ax_curve.set_title("MPJPE / frame", color='#CCCCEE', fontsize=7, pad=3)
+        self.ax_curve.set_xlabel("Frame", color='#AAAACC', fontsize=6)
+        self.ax_curve.set_ylabel("px",    color='#AAAACC', fontsize=6)
+        self.ax_curve.legend(fontsize=5, facecolor='#2A2A3E',
                              labelcolor='white', framealpha=0.5)
         self.ax_curve.set_facecolor('#2A2A3E')
-        self.ax_curve.tick_params(colors='#AAAACC', labelsize=6)
+        self.ax_curve.tick_params(colors='#AAAACC', labelsize=5)
         self.ax_curve.spines[:].set_color('#444466')
 
-        # --- Barres MPJPE par modèle ---
-        mpjpe_vals = [summaries[m].get("mpjpe_mean", 0) for m in model_names]
-        bars = self.ax_bars.bar(model_names, mpjpe_vals, color=colors,
-                                edgecolor='#1E1E2E', width=0.5)
-
-        for bar, val in zip(bars, mpjpe_vals):
-            self.ax_bars.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.5,
-                f"{val:.1f}",
-                ha='center', color='white', fontsize=7, fontweight='bold'
-            )
-
-        self.ax_bars.set_title("MPJPE moyen (px)", color='#CCCCEE',
-                               fontsize=8, pad=4)
+        # Graphe droite : MPJPE moyen par modèle
+        vals = [summaries[m].get("mpjpe_mean", 0) for m in models]
+        bars = self.ax_bars.bar(models, vals, color=colors, edgecolor='#1E1E2E', width=0.5)
+        for bar, val in zip(bars, vals):
+            self.ax_bars.text(bar.get_x() + bar.get_width()/2, bar.get_height()+0.5,
+                              f"{val:.1f}", ha='center', color='white',
+                              fontsize=6, fontweight='bold')
+        self.ax_bars.set_title("MPJPE moyen (px)", color='#CCCCEE', fontsize=7, pad=3)
         self.ax_bars.set_facecolor('#2A2A3E')
-        self.ax_bars.tick_params(colors='#AAAACC', labelsize=7)
+        self.ax_bars.tick_params(colors='#AAAACC', labelsize=6)
         self.ax_bars.spines[:].set_color('#444466')
-
         self.fig.canvas.draw_idle()
+
+
+
+
+# =============================================================================
+# WIDGET SLOT CAMÉRA
+# =============================================================================
+
+class CameraSlotWidget(QGroupBox):
+    """
+    Widget représentant un slot caméra dans la barre de contrôle.
+    Contient : bouton vidéo, bouton calibration, indicateurs de statut GT.
+    """
+
+    def __init__(self, cam_idx: int, on_video_loaded, on_calib_loaded, parent=None):
+        super().__init__(f"📷 Cam {cam_idx + 1}", parent)
+        self.cam_idx        = cam_idx
+        self.on_video_loaded = on_video_loaded
+        self.on_calib_loaded = on_calib_loaded
+
+        self.video_path = None
+        self.calib_path = None
+        self.gt_path    = None
+
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(3)
+        layout.setContentsMargins(4, 12, 4, 4)
+
+        # Boutons vidéo + calibration côte-à-côte
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+
+        self.btn_video = QPushButton("🎬 Vidéo")
+        self.btn_video.setObjectName("btn_slot")
+        self.btn_video.setFixedHeight(26)
+        self.btn_video.clicked.connect(self._pick_video)
+        btn_row.addWidget(self.btn_video)
+
+        self.btn_calib = QPushButton("📐 Calib")
+        self.btn_calib.setObjectName("btn_slot")
+        self.btn_calib.setFixedHeight(26)
+        self.btn_calib.clicked.connect(self._pick_calib)
+        btn_row.addWidget(self.btn_calib)
+        layout.addLayout(btn_row)
+
+        # Label vidéo
+        self.lbl_video = QLabel("Vidéo : —")
+        self.lbl_video.setObjectName("lbl_slot")
+        self.lbl_video.setWordWrap(True)
+        self.lbl_video.setMaximumHeight(32)
+        layout.addWidget(self.lbl_video)
+
+        # Label calibration
+        self.lbl_calib = QLabel("Calib : —")
+        self.lbl_calib.setObjectName("lbl_slot")
+        self.lbl_calib.setWordWrap(True)
+        self.lbl_calib.setMaximumHeight(32)
+        layout.addWidget(self.lbl_calib)
+
+        # GT status
+        self.lbl_gt = QLabel("GT : —")
+        self.lbl_gt.setObjectName("lbl_gt_pending")
+        layout.addWidget(self.lbl_gt)
+
+    def _pick_video(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Vidéo — Cam {self.cam_idx + 1}", "",
+            "Vidéos (*.mp4 *.avi *.mov)"
+        )
+        if not path:
+            return
+        self.video_path = path
+        name = os.path.basename(path)
+        self.lbl_video.setText(f"✅ {name}")
+        self.lbl_video.setObjectName("lbl_slot_ok")
+
+        # Auto-détection GT
+        self.gt_path = auto_detect_gt(path)
+        if self.gt_path:
+            self.lbl_gt.setText("GT : ⏳ Calibration requise")
+            self.lbl_gt.setObjectName("lbl_gt_pending")
+        else:
+            self.lbl_gt.setText("GT : ❌ Fichier joints3d introuvable")
+            self.lbl_gt.setObjectName("lbl_gt_error")
+
+        self._refresh_style()
+        self.on_video_loaded(self.cam_idx, path)
+
+    def _pick_calib(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Calibration — Cam {self.cam_idx + 1}", "",
+            "JSON (*.json)"
+        )
+        if not path:
+            return
+        self.calib_path = path
+        name = os.path.basename(path)
+        self.lbl_calib.setText(f"✅ {name}")
+        self.lbl_calib.setObjectName("lbl_slot_ok")
+
+        # GT est calculable si joints3d trouvé
+        if self.gt_path:
+            self.lbl_gt.setText("GT : ✅ Prête (calculée par calibration)")
+            self.lbl_gt.setObjectName("lbl_gt_ok")
+        else:
+            self.lbl_gt.setText("GT : ❌ Charger une vidéo d'abord")
+            self.lbl_gt.setObjectName("lbl_gt_error")
+
+        self._refresh_style()
+        self.on_calib_loaded(self.cam_idx, path)
+
+    def is_ready(self) -> bool:
+        return all([self.video_path, self.calib_path, self.gt_path])
+
+    def _refresh_style(self):
+        self.style().unpolish(self)
+        self.style().polish(self)
 
 
 # =============================================================================
@@ -277,195 +362,184 @@ class LiveChartCanvas(FigureCanvas):
 # =============================================================================
 
 class MainWindow(QMainWindow):
-    """
-    Fenêtre principale de l'application de comparaison de pose 2D.
-
-    Gère :
-    - La barre de contrôle (chargement des fichiers + lancement)
-    - Le split-screen (3 panels vidéo annotés)
-    - Le tableau de métriques
-    - Les graphiques temps réel
-    - L'export CSV + PDF en fin d'évaluation
-    """
-
     def __init__(self):
         super().__init__()
-
-        # --- Chemins des fichiers chargés ---
-        self.video_path   = None
-        self.gt_path      = None
-        self.calib_path   = None
-
-        # --- Thread de travail ---
-        self.worker = None
-
-        # --- Estimateurs (initialisés au lancement) ---
+        self.workers    = []
         self.estimators = []
-
-        # --- Données métriques courantes ---
-        self._current_summaries  = {}
-        self._current_fps        = {}
-        self._current_histories  = {}
+        self._current_summaries = {}
+        self._current_fps       = {}
+        self._current_histories = {}
+        self._finished_workers  = 0
 
         self._setup_ui()
         self._apply_dark_theme()
 
     # -------------------------------------------------------------------------
-    # INITIALISATION DE L'UI
+    # UI
     # -------------------------------------------------------------------------
 
     def _setup_ui(self):
-        """Construit tous les widgets et les dispose dans la fenêtre."""
-        self.setWindowTitle("Comparaison de Modèles de Pose 2D — Fit3D Evaluator")
-        self.setMinimumSize(1400, 850)
+        self.setWindowTitle(
+            "Comparaison Multi-Caméra — BlazePose / YOLO-Pose / OpenPose"
+        )
+        self.setMinimumSize(1500, 920)
 
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setSpacing(6)
-        main_layout.setContentsMargins(8, 8, 8, 8)
+        root = QVBoxLayout(central)
+        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
 
-        # --- Barre de contrôle ---
-        main_layout.addWidget(self._build_control_bar())
+        root.addWidget(self._build_control_bar())
 
-        # --- Corps principal : split-screen + graphiques ---
-        body_layout = QHBoxLayout()
-        body_layout.setSpacing(8)
+        # Création de la zone défilante (scrollable)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
 
-        # Colonne gauche : vidéo + tableau
-        left_col = QVBoxLayout()
-        left_col.setSpacing(6)
-        left_col.addWidget(self._build_video_panel(), stretch=4)
-        left_col.addWidget(self._build_table_panel(), stretch=1)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setSpacing(15)
 
-        left_widget = QWidget()
-        left_widget.setLayout(left_col)
-        body_layout.addWidget(left_widget, stretch=4)
+        scroll_layout.addWidget(self._build_grid_panel())
+        # Tableau de métriques supprimé de l'interface (trop encombrant)
 
-        # Colonne droite : graphiques
-        body_layout.addWidget(self._build_charts_panel(), stretch=1)
+        
+        charts_panel = self._build_charts_panel()
+        charts_panel.setMinimumHeight(350)
+        scroll_layout.addWidget(charts_panel)
 
-        main_layout.addLayout(body_layout, stretch=1)
+        scroll_area.setWidget(scroll_content)
+        root.addWidget(scroll_area, stretch=1)
 
-        # --- Barre de statut / progression ---
         self.status_bar = self.statusBar()
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(300)
+        self.progress_bar.setMaximumWidth(340)
         self.progress_bar.setVisible(False)
         self.status_bar.addPermanentWidget(self.progress_bar)
-        self.status_bar.showMessage("Prêt — Chargez une vidéo, la Ground Truth et la calibration caméra.")
+        self.status_bar.showMessage(
+            "Prêt — Chargez une vidéo et une calibration pour chaque caméra."
+        )
+
+        # Auto-chargement par défaut (squat) appelé une fois que l'UI est prête
+        self._auto_load_default_squat()
+
+    def _auto_load_default_squat(self):
+        default_vid = "/Users/HP/Desktop/ikram/M2/PFE/models_comparaison/s03/videos/65906101LF/squat.mp4"
+        default_calib = "/Users/HP/Desktop/ikram/M2/PFE/models_comparaison/s03/camera_parameters/65906101LF/squat.json"
+        
+        if os.path.exists(default_vid) and os.path.exists(default_calib):
+            # On charge sur le 1er slot (index 0)
+            slot = self.cam_slots[0]
+            slot.video_path = default_vid
+            slot.calib_path = default_calib
+            slot.gt_path = "/Users/HP/Desktop/ikram/M2/PFE/models_comparaison/s03/joints3d_25/squat.json"
+            
+            slot.lbl_video.setText(f"✅ squat.mp4")
+            slot.lbl_video.setObjectName("lbl_slot_ok")
+            slot.lbl_calib.setText(f"✅ squat.json")
+            slot.lbl_calib.setObjectName("lbl_slot_ok")
+            slot.lbl_gt.setText("GT : ✅ Auto-chargé")
+            slot.lbl_gt.setObjectName("lbl_gt_ok")
+            slot._refresh_style()
+            
+            # Émet les events de chargement pour mettre à jour la logique interne
+            self._on_slot_video_loaded(0, slot.video_path)
+            self._on_slot_calib_loaded(0, slot.calib_path)
+
+    # --- Barre de contrôle : 4 slots + boutons lancer/arrêter ---------------
 
     def _build_control_bar(self) -> QWidget:
-        """Construit la barre de contrôle en haut avec les 4 boutons."""
-        container = QGroupBox("Contrôles")
-        layout    = QHBoxLayout(container)
+        outer = QGroupBox("Configuration de la vidéo")
+        layout = QHBoxLayout(outer)
         layout.setSpacing(10)
+        
+        # Slot caméra (on n'en a qu'un pour l'instant)
+        self.cam_slots: list[CameraSlotWidget] = []
+        for i in range(N_CAMS):
+            slot = CameraSlotWidget(
+                i,
+                on_video_loaded=self._on_slot_video_loaded,
+                on_calib_loaded=self._on_slot_calib_loaded,
+            )
+            slot.setMinimumWidth(200)
+            layout.addWidget(slot, stretch=1)
+            self.cam_slots.append(slot)
 
-        # Bouton : Charger vidéo
-        self.btn_video = QPushButton("🎬 Charger vidéo (.mp4)")
-        self.btn_video.clicked.connect(self._load_video)
-        self.btn_video.setObjectName("btn_load")
-        layout.addWidget(self.btn_video)
+        layout.addWidget(self._vsep())
 
-        # Affichage du nom de fichier vidéo
-        self.lbl_video = QLabel("Aucune vidéo")
-        self.lbl_video.setObjectName("lbl_file")
-        layout.addWidget(self.lbl_video)
+        # Boutons lancer / arrêter
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(8)
 
-        layout.addWidget(self._separator())
-
-        # Bouton : Charger Ground Truth
-        self.btn_gt = QPushButton("📐 Charger Ground Truth (.json)")
-        self.btn_gt.clicked.connect(self._load_gt)
-        self.btn_gt.setObjectName("btn_load")
-        layout.addWidget(self.btn_gt)
-
-        self.lbl_gt = QLabel("Aucune GT")
-        self.lbl_gt.setObjectName("lbl_file")
-        layout.addWidget(self.lbl_gt)
-
-        layout.addWidget(self._separator())
-
-        # Bouton : Charger Calibration
-        self.btn_calib = QPushButton("📷 Charger Calibration (.json)")
-        self.btn_calib.clicked.connect(self._load_calib)
-        self.btn_calib.setObjectName("btn_load")
-        layout.addWidget(self.btn_calib)
-
-        self.lbl_calib = QLabel("Aucune calibration")
-        self.lbl_calib.setObjectName("lbl_file")
-        layout.addWidget(self.lbl_calib)
-
-        layout.addStretch()
-
-        # Bouton : Lancer l'évaluation
-        self.btn_run = QPushButton("▶  Lancer l'évaluation")
+        self.btn_run = QPushButton("▶  Lancer\nl'évaluation")
         self.btn_run.setObjectName("btn_run")
         self.btn_run.clicked.connect(self._start_evaluation)
         self.btn_run.setEnabled(False)
-        layout.addWidget(self.btn_run)
+        self.btn_run.setMinimumHeight(60)
+        btn_col.addWidget(self.btn_run)
 
-        # Bouton : Arrêter
         self.btn_stop = QPushButton("⏹  Arrêter")
         self.btn_stop.setObjectName("btn_stop")
         self.btn_stop.clicked.connect(self._stop_evaluation)
         self.btn_stop.setEnabled(False)
-        layout.addWidget(self.btn_stop)
+        btn_col.addWidget(self.btn_stop)
 
-        return container
+        layout.addLayout(btn_col)
+        return outer
 
-    def _build_video_panel(self) -> QWidget:
-        """Construit le split-screen avec 3 panels vidéo."""
-        container = QGroupBox("Visualisation Pose 2D")
-        layout    = QHBoxLayout(container)
-        layout.setSpacing(4)
+    # --- Grille 3 × 4 -------------------------------------------------------
 
-        # Panel BlazePose (vert)
-        self.panel_bp   = self._make_video_label("BlazePose", "#00C853")
-        # Panel YOLO-Pose (bleu)
-        self.panel_yolo = self._make_video_label("YOLO-Pose", "#2196F3")
-        # Panel OpenPose (rouge)
-        self.panel_op   = self._make_video_label("OpenPose",  "#F44336")
+    def _build_grid_panel(self) -> QWidget:
+        container = QGroupBox("Visualisation — Vidéo (3 Modèles)")
+        outer = QVBoxLayout(container)
 
-        layout.addWidget(self.panel_bp)
-        layout.addWidget(self.panel_yolo)
-        layout.addWidget(self.panel_op)
+        grid = QGridLayout()
+        grid.setSpacing(4)
 
+        # self.panels[model_idx][cam_idx]
+        self.panels: list[list[QLabel]] = []
+        for model_idx, (name, color) in enumerate(zip(MODEL_NAMES, MODEL_COLORS)):
+            model_lbl = QLabel(name)
+            model_lbl.setAlignment(Qt.AlignCenter)
+            model_lbl.setStyleSheet(
+                f"color:{color};font-weight:bold;font-size:14px;"
+            )
+            grid.addWidget(model_lbl, 0, model_idx)
+
+            row_panels = []
+            for cam_idx in range(N_CAMS):
+                p = self._make_video_label(f"{name}", color)
+                grid.addWidget(p, 1, model_idx)
+                row_panels.append(p)
+            self.panels.append(row_panels)
+
+        outer.addLayout(grid)
         return container
 
     def _make_video_label(self, title: str, color: str) -> QLabel:
-        """
-        Crée un QLabel stylisé pour afficher une frame vidéo annotée.
-
-        Paramètres :
-            title : nom du modèle (affiché si pas de vidéo)
-            color : couleur hex de l'encadrement
-        """
-        lbl = QLabel(f"{title}\n(en attente...)")
+        lbl = QLabel(title)
         lbl.setObjectName("video_panel")
         lbl.setAlignment(Qt.AlignCenter)
         lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        lbl.setMinimumSize(350, 280)
+        lbl.setMinimumSize(560, 420)  # Panneaux vidéo agrandis
         lbl.setStyleSheet(
-            f"QLabel#video_panel {{"
-            f"  background: #0D1117;"
-            f"  border: 2px solid {color};"
-            f"  border-radius: 6px;"
-            f"  color: {color};"
-            f"  font-weight: bold;"
-            f"  font-size: 14px;"
-            f"}}"
+            f"QLabel#video_panel{{"
+            f"background:#0D1117;border:2px solid {color};"
+            f"border-radius:5px;color:{color};"
+            f"font-weight:bold;font-size:10px;}}"
         )
         return lbl
 
-    def _build_table_panel(self) -> QWidget:
-        """Construit le tableau de métriques."""
-        container = QGroupBox("Tableau de métriques (mis à jour toutes les 30 frames)")
-        layout    = QVBoxLayout(container)
+    # --- Tableau de métriques ------------------------------------------------
 
-        self.metrics_table = QTableWidget(3, 6)
+    def _build_table_panel(self) -> QWidget:
+        container = QGroupBox("Tableau de métriques (mis à jour toutes les 30 frames)")
+        layout = QVBoxLayout(container)
+
+        self.metrics_table = QTableWidget(N_MODELS, 5)
         self.metrics_table.setHorizontalHeaderLabels([
-            "Modèle", "FPS", "MPJPE (px)", "PCK@0.1 (%)",
+            "Modèle", "FPS", "MPJPE (px)",
             "Meilleur joint", "Pire joint"
         ])
         self.metrics_table.verticalHeader().setVisible(False)
@@ -473,12 +547,10 @@ class MainWindow(QMainWindow):
         self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.metrics_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.metrics_table.setSelectionMode(QTableWidget.NoSelection)
-        self.metrics_table.setMaximumHeight(130)
+        self.metrics_table.setMaximumHeight(120)
 
-        # Préremplir les noms de modèles
-        model_names  = ["BlazePose", "YOLO-Pose", "OpenPose"]
-        row_colors   = ["#003D1A", "#002050", "#3D0000"]
-        for row, (name, clr) in enumerate(zip(model_names, row_colors)):
+        row_colors = ["#003D1A", "#002050", "#3D0000"]
+        for row, (name, clr) in enumerate(zip(MODEL_NAMES, row_colors)):
             item = QTableWidgetItem(name)
             item.setTextAlignment(Qt.AlignCenter)
             item.setFont(QFont("Arial", 10, QFont.Bold))
@@ -493,255 +565,208 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.metrics_table)
         return container
 
-    def _build_charts_panel(self) -> QWidget:
-        """Construit le panneau de graphiques matplotlib."""
-        container = QGroupBox("Graphiques dynamiques")
-        layout    = QVBoxLayout(container)
-        container.setMinimumWidth(320)
+    # --- Graphiques ----------------------------------------------------------
 
-        self.chart_canvas = LiveChartCanvas(parent=container,
-                                            width=4, height=8, dpi=90)
+    def _build_charts_panel(self) -> QWidget:
+        container = QGroupBox("Graphiques dynamiques")
+        layout = QVBoxLayout(container)
+        container.setMinimumWidth(280)
+        self.chart_canvas = LiveChartCanvas(parent=container)
         layout.addWidget(self.chart_canvas)
         return container
 
     # -------------------------------------------------------------------------
-    # GESTION DES FICHIERS
+    # CALLBACKS DES SLOTS CAMÉRA
     # -------------------------------------------------------------------------
 
-    def _load_video(self):
-        """Ouvre un sélecteur de fichier pour la vidéo .mp4."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Charger une vidéo Fit3D", "",
-            "Vidéos (*.mp4 *.avi *.mov)"
-        )
-        if path:
-            self.video_path = path
-            self.lbl_video.setText(os.path.basename(path))
-            self._check_ready()
+    def _on_slot_video_loaded(self, cam_idx: int, video_path: str):
+        """Appelé quand l'utilisateur charge une vidéo pour un slot."""
+        # Afficher la première frame dans les 3 panneaux de la colonne
+        frame = extract_first_frame(video_path)
+        if frame is not None:
+            for model_idx in range(N_MODELS):
+                self._show_frame(self.panels[model_idx][cam_idx], frame)
+        self._check_ready()
 
-    def _load_gt(self):
-        """Ouvre un sélecteur pour le fichier joints3d_25 .json."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Charger la Ground Truth (joints3d_25)", "",
-            "JSON (*.json)"
-        )
-        if path:
-            self.gt_path = path
-            self.lbl_gt.setText(os.path.basename(path))
-            self._check_ready()
-
-    def _load_calib(self):
-        """Ouvre un sélecteur pour le fichier de calibration caméra .json."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Charger la calibration caméra", "",
-            "JSON (*.json)"
-        )
-        if path:
-            self.calib_path = path
-            self.lbl_calib.setText(os.path.basename(path))
-            self._check_ready()
+    def _on_slot_calib_loaded(self, cam_idx: int, calib_path: str):
+        """Appelé quand l'utilisateur charge une calibration pour un slot."""
+        self._check_ready()
 
     def _check_ready(self):
-        """Active le bouton Lancer si les 3 fichiers sont chargés."""
-        ready = all([self.video_path, self.gt_path, self.calib_path])
-        self.btn_run.setEnabled(ready)
+        """Active le bouton Lancer seulement si les 4 slots sont complets."""
+        all_ready = all(slot.is_ready() for slot in self.cam_slots)
+        self.btn_run.setEnabled(all_ready)
 
     # -------------------------------------------------------------------------
-    # LANCEMENT / ARRÊT DE L'ÉVALUATION
+    # LANCEMENT / ARRÊT
     # -------------------------------------------------------------------------
 
     def _start_evaluation(self):
-        """
-        Initialise les estimateurs, charge la GT, et lance le QThread.
-        """
-        # Nettoyage d'un éventuel thread précédent
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
-            self.worker.wait()
+        if hasattr(self, 'workers'):
+            for w in self.workers:
+                if w.isRunning():
+                    w.stop()
+                    w.wait()
 
-        self.status_bar.showMessage("Initialisation des modèles...")
+        self.status_bar.showMessage("Initialisation des modèles et calibrations...")
         QApplication.processEvents()
 
-        # --- Chargement calibration + GT ---
-        try:
-            calib     = CameraCalibration(self.calib_path)
-            gt_loader = GroundTruthLoader(self.gt_path, calib)
-        except Exception as e:
-            QMessageBox.critical(self, "Erreur de chargement",
-                                 f"Impossible de charger GT/Calibration :\n{e}")
-            return
+        # Chargement des GT loaders (1 par caméra, projection via calibration)
+        gt_loaders = []
+        for i, slot in enumerate(self.cam_slots):
+            try:
+                # Récupérer les dimensions de la vidéo pour le filtre GT
+                cap = cv2.VideoCapture(slot.video_path)
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
 
-        # --- Initialisation des estimateurs ---
+                calib     = CameraCalibration(slot.calib_path)
+                gt_loader = GroundTruthLoader(slot.gt_path, calib, img_width=w, img_height=h)
+                gt_loaders.append(gt_loader)
+            except Exception as e:
+                QMessageBox.critical(
+                    self, f"Erreur Cam {i+1}",
+                    f"Impossible de charger calibration/GT pour Cam {i+1}:\n{e}"
+                )
+                return
+
+        # Initialisation des estimateurs
         self.estimators = []
-        try:
-            self.status_bar.showMessage("Chargement BlazePose...")
-            QApplication.processEvents()
-            self.estimators.append(BlazePoseEstimator())
-        except Exception as e:
-            QMessageBox.warning(self, "BlazePose", f"Erreur init BlazePose:\n{e}")
-
-        try:
-            self.status_bar.showMessage("Chargement YOLO-Pose...")
-            QApplication.processEvents()
-            self.estimators.append(YoloPoseEstimator())
-        except Exception as e:
-            QMessageBox.warning(self, "YOLO-Pose", f"Erreur init YOLO:\n{e}")
-
-        try:
-            self.status_bar.showMessage("Chargement OpenPose...")
-            QApplication.processEvents()
-            self.estimators.append(OpenPoseEstimator())
-        except Exception as e:
-            QMessageBox.warning(self, "OpenPose", f"Erreur init OpenPose:\n{e}")
+        for name, cls in [("BlazePose", BlazePoseEstimator),
+                           ("YOLO-Pose", YoloPoseEstimator),
+                           ("OpenPose",  OpenPoseEstimator)]:
+            try:
+                self.status_bar.showMessage(f"Chargement {name}...")
+                QApplication.processEvents()
+                self.estimators.append(cls())
+            except Exception as e:
+                QMessageBox.warning(self, name, f"Erreur init {name}:\n{e}")
 
         if not self.estimators:
             QMessageBox.critical(self, "Erreur",
                                  "Aucun estimateur n'a pu être initialisé.")
             return
 
-        # --- Démarrage du worker ---
-        self.worker = EvaluationWorker(self.video_path, self.estimators,
-                                       gt_loader)
-        self.worker.frame_ready.connect(self._on_frame_ready)
-        self.worker.metrics_update.connect(self._on_metrics_update)
-        self.worker.finished_eval.connect(self._on_finished)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.error_signal.connect(self._on_error)
+        video_path = self.cam_slots[0].video_path
+        gt_loader  = gt_loaders[0]
+        
+        self.workers = []
+        self._finished_workers = 0
+        for est in self.estimators:
+            w = SingleModelWorker(video_path, est, gt_loader)
+            w.frame_ready.connect(self._on_model_frame_ready)
+            w.metrics_update.connect(self._on_model_metrics_update)
+            w.finished_eval.connect(self._on_model_finished)
+            w.progress.connect(self._on_model_progress)
+            w.error_signal.connect(self._on_error)
+            self.workers.append(w)
 
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
-        self.worker.start()
-        self.status_bar.showMessage("Évaluation en cours...")
+        for w in self.workers:
+            w.start()
+        self.status_bar.showMessage("Évaluation asynchrone des modèles en cours...")
 
     def _stop_evaluation(self):
-        """Arrête proprement le thread d'évaluation."""
-        if self.worker:
-            self.worker.stop()
+        for w in self.workers:
+            w.stop()
         self.btn_stop.setEnabled(False)
         self.btn_run.setEnabled(True)
         self.status_bar.showMessage("Évaluation arrêtée.")
 
     # -------------------------------------------------------------------------
-    # SLOTS (réponses aux signaux du worker)
+    # SLOTS
     # -------------------------------------------------------------------------
 
-    def _on_frame_ready(self, frame_bp, frame_yolo, frame_op, frame_idx):
-        """
-        Reçoit les 3 frames annotées et les affiche dans les panels.
-        Convertit les images OpenCV (BGR numpy) en QPixmap.
-        """
-        self._show_frame(self.panel_bp,   frame_bp)
-        self._show_frame(self.panel_yolo, frame_yolo)
-        self._show_frame(self.panel_op,   frame_op)
+    def _on_model_frame_ready(self, model_name: str, frame: np.ndarray, frame_idx: int):
+        """Affiche la frame annotée dans le bon panneau."""
+        if model_name in MODEL_NAMES:
+            model_idx = MODEL_NAMES.index(model_name)
+            # En mode 1 caméra, la grille est Panels[model_idx][0]
+            self._show_frame(self.panels[model_idx][0], frame)
 
     def _show_frame(self, label: QLabel, frame: np.ndarray):
-        """
-        Convertit une image OpenCV BGR en QPixmap et l'affiche dans un QLabel.
-
-        Étapes :
-        1. Conversion BGR→RGB
-        2. Création d'un QImage depuis les données numpy
-        3. Redimensionnement proportionnel au QLabel
-        4. Affichage via setPixmap
-        """
         h, w = frame.shape[:2]
-        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        qimg  = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
-        pix   = QPixmap.fromImage(qimg)
-
-        # Redimensionnement proportionnel sans déformer
-        pix_scaled = pix.scaled(
+        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # La copie est obligatoire pour éviter que Python ne libère la mémoire de l'image
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        pix  = QPixmap.fromImage(qimg).scaled(
             label.width(), label.height(),
             Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
-        label.setPixmap(pix_scaled)
+        label.setPixmap(pix)
 
-    def _on_metrics_update(self, summaries: dict, fps_dict: dict,
-                           histories: dict):
-        """Met à jour le tableau et les graphiques toutes les 30 frames."""
-        self._current_summaries = summaries
-        self._current_fps       = fps_dict
-        self._current_histories = histories
+    def _on_model_metrics_update(self, model_name: str, summary: dict, fps: float, history: list):
+        self._current_summaries[model_name] = summary
+        self._current_fps[model_name]       = fps
+        self._current_histories[model_name] = history
+        self._update_table(self._current_summaries, self._current_fps)
+        self.chart_canvas.update_charts(self._current_summaries, self._current_fps, self._current_histories)
 
-        self._update_table(summaries, fps_dict)
-        self.chart_canvas.update_charts(summaries, fps_dict, histories)
-
-    def _update_table(self, summaries: dict, fps_dict: dict):
-        """Met à jour le tableau de métriques."""
-        model_order = ["BlazePose", "YOLO-Pose", "OpenPose"]
-
-        for row, model_name in enumerate(model_order):
-            # Chercher le bon estimateur (peut être absent si init a échoué)
-            matching = [m for m in summaries if m == model_name]
-            if not matching:
+    def _update_table(self, summaries, fps_dict):
+        if not hasattr(self, 'metrics_table'):
+            return   # tableau supprimé de l'interface
+        for row, model_name in enumerate(MODEL_NAMES):
+            if model_name not in summaries:
                 continue
-
             s   = summaries[model_name]
             fps = fps_dict.get(model_name, 0.0)
-
             data = [
                 model_name,
                 f"{fps:.1f}",
                 f"{s.get('mpjpe_mean', 0):.2f}",
-                f"{s.get('pck_mean', 0):.1f}%",
                 s.get("best_joint",  "N/A").replace("_", " ").title(),
                 s.get("worst_joint", "N/A").replace("_", " ").title(),
             ]
-
             for col, val in enumerate(data):
                 item = self.metrics_table.item(row, col)
                 if item:
                     item.setText(val)
 
-    def _on_finished(self, summaries: dict, fps_dict: dict, histories: dict):
-        """
-        Appelé quand la vidéo est entièrement traitée.
-        Exporte les résultats et affiche un résumé.
-        """
-        self.btn_stop.setEnabled(False)
-        self.btn_run.setEnabled(True)
-        self.progress_bar.setVisible(False)
 
-        self._update_table(summaries, fps_dict)
-        self.chart_canvas.update_charts(summaries, fps_dict, histories)
+    def _on_model_finished(self, model_name: str, summary: dict, fps: float, history: list):
+        self._on_model_metrics_update(model_name, summary, fps, history)
+        self._finished_workers += 1
 
-        # Export CSV + PDF dans le même dossier que la vidéo
-        out_dir = os.path.dirname(self.video_path)
+        if self._finished_workers >= len(self.workers):
+            self.btn_stop.setEnabled(False)
+            self.btn_run.setEnabled(True)
+            self.progress_bar.setVisible(False)
+
+        out_dir = "/Users/HP/Desktop/ikram/M2/PFE/models_comparaison/output_result"
+        os.makedirs(out_dir, exist_ok=True)
         csv_path = os.path.join(out_dir, "results.csv")
         pdf_path = os.path.join(out_dir, "report.pdf")
-
         try:
-            save_csv(summaries, fps_dict, csv_path)
-            generate_pdf(summaries, fps_dict, histories, pdf_path)
-
+            save_csv(self._current_summaries, self._current_fps, csv_path)
+            generate_pdf(self._current_summaries, self._current_fps, self._current_histories, pdf_path)
             self.status_bar.showMessage(
-                f"✅ Évaluation terminée ! CSV : {csv_path} | PDF : {pdf_path}"
+                f"✅ Terminé ! CSV : {csv_path} | PDF : {pdf_path}"
             )
             QMessageBox.information(
                 self, "Évaluation terminée",
-                f"Les résultats ont été exportés :\n\n"
-                f"📊 CSV : {csv_path}\n"
-                f"📄 PDF : {pdf_path}"
+                f"Résultats exportés :\n\n📊 CSV : {csv_path}\n📄 PDF : {pdf_path}"
             )
         except Exception as e:
-            self.status_bar.showMessage(f"Évaluation terminée. Erreur export : {e}")
+            self.status_bar.showMessage(f"Terminé. Erreur export : {e}")
             QMessageBox.warning(self, "Erreur export", str(e))
 
-    def _on_progress(self, current: int, total: int):
-        """Met à jour la barre de progression."""
+    def _on_model_progress(self, model_name: str, current: int, total: int):
         if total > 0:
             pct = int(current / total * 100)
-            self.progress_bar.setValue(pct)
+            # Met à jour la barre de progression uniquement avec le modèle le plus avancé
+            if pct > self.progress_bar.value():
+                self.progress_bar.setValue(pct)
             self.status_bar.showMessage(
-                f"Évaluation : frame {current}/{total} ({pct}%)"
+                f"Évaluation [{model_name}] : frame {current}/{total}"
             )
 
-    def _on_error(self, msg: str):
-        """Affiche un message d'erreur."""
-        QMessageBox.critical(self, "Erreur", msg)
+    def _on_error(self, model_name: str, msg: str):
+        QMessageBox.critical(self, f"Erreur {model_name}", msg)
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
@@ -750,8 +775,7 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def _separator() -> QFrame:
-        """Crée un séparateur vertical."""
+    def _vsep() -> QFrame:
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
         sep.setFrameShadow(QFrame.Sunken)
@@ -759,22 +783,18 @@ class MainWindow(QMainWindow):
         return sep
 
     def _apply_dark_theme(self):
-        """Applique un thème sombre complet à l'application."""
         self.setStyleSheet("""
-            /* Fenêtre principale */
             QMainWindow, QWidget {
                 background-color: #0D1117;
                 color: #E0E0FF;
                 font-family: 'Segoe UI', Arial, sans-serif;
                 font-size: 12px;
             }
-
-            /* GroupBox */
             QGroupBox {
                 background-color: #161B27;
                 border: 1px solid #2A2D4A;
                 border-radius: 8px;
-                margin-top: 10px;
+                margin-top: 12px;
                 padding: 8px;
                 font-weight: bold;
                 color: #8B9BFF;
@@ -788,18 +808,34 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
             }
 
-            /* Boutons de chargement */
-            QPushButton#btn_load {
-                background-color: #1E2A45;
-                border: 1px solid #3A4A7A;
+            /* Slots caméra */
+            QPushButton#btn_slot {
+                background-color: #1A2340;
+                border: 1px solid #2A3A6A;
                 border-radius: 6px;
-                padding: 6px 12px;
-                color: #A0B0FF;
-                font-weight: 500;
+                padding: 5px 8px;
+                color: #8B9BFF;
+                font-size: 11px;
             }
-            QPushButton#btn_load:hover {
-                background-color: #2A3A60;
-                border-color: #5A7ADA;
+            QPushButton#btn_slot:hover {
+                background-color: #253060;
+                border-color: #4A6ACA;
+            }
+
+            QLabel#lbl_slot      { color: #5A6A8A; font-size: 10px; font-style: italic; }
+            QLabel#lbl_slot_ok   { color: #00C853; font-size: 10px; }
+            QLabel#lbl_gt_pending{ color: #FF9800; font-size: 10px; font-style: italic; }
+            QLabel#lbl_gt_ok     { color: #00C853; font-size: 10px; font-weight: bold; }
+            QLabel#lbl_gt_error  { color: #F44336; font-size: 10px; }
+
+            /* Grille */
+            QLabel#grid_header {
+                color: #8B9BFF;
+                font-weight: bold;
+                font-size: 11px;
+                background: #161B27;
+                border-radius: 4px;
+                padding: 2px;
             }
 
             /* Bouton Lancer */
@@ -808,12 +844,12 @@ class MainWindow(QMainWindow):
                     stop:0 #1B5E20, stop:1 #2E7D32);
                 border: none;
                 border-radius: 8px;
-                padding: 8px 20px;
+                padding: 8px 18px;
                 color: white;
                 font-weight: bold;
                 font-size: 13px;
             }
-            QPushButton#btn_run:hover  { background-color: #388E3C; }
+            QPushButton#btn_run:hover    { background-color: #388E3C; }
             QPushButton#btn_run:disabled { background-color: #1A2A1A; color: #444; }
 
             /* Bouton Arrêter */
@@ -821,18 +857,11 @@ class MainWindow(QMainWindow):
                 background-color: #3D1010;
                 border: 1px solid #7A3030;
                 border-radius: 8px;
-                padding: 8px 20px;
+                padding: 8px 18px;
                 color: #FF8080;
                 font-weight: bold;
             }
             QPushButton#btn_stop:hover { background-color: #5A1515; }
-
-            /* Labels de noms de fichiers */
-            QLabel#lbl_file {
-                color: #7080A0;
-                font-style: italic;
-                font-size: 11px;
-            }
 
             /* Tableau */
             QTableWidget {
@@ -843,48 +872,35 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
             }
             QTableWidget::item { padding: 4px; }
-            QTableWidget::item:selected { background-color: #2A3A60; }
             QHeaderView::section {
                 background-color: #1A237E;
                 color: white;
-                padding: 6px;
+                padding: 5px;
                 border: none;
                 font-weight: bold;
-                font-size: 11px;
+                font-size: 10px;
             }
             QTableWidget::item:alternate { background-color: #161B27; }
 
-            /* Barre de statut */
-            QStatusBar { color: #8B9BFF; font-size: 11px; background: #0D1117; }
-
-            /* Barre de progression */
+            QStatusBar  { color: #8B9BFF; font-size: 11px; background: #0D1117; }
             QProgressBar {
-                border: 1px solid #2A2D4A;
-                border-radius: 4px;
-                background: #161B27;
-                text-align: center;
-                color: white;
+                border: 1px solid #2A2D4A; border-radius: 4px;
+                background: #161B27; text-align: center; color: white;
             }
             QProgressBar::chunk {
                 background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
                     stop:0 #1B5E20, stop:1 #2196F3);
                 border-radius: 3px;
             }
-
-            /* Scrollbar */
             QScrollBar:vertical {
-                background: #161B27;
-                width: 8px;
-                border-radius: 4px;
+                background: #161B27; width: 8px; border-radius: 4px;
             }
             QScrollBar::handle:vertical {
-                background: #3A4A7A;
-                border-radius: 4px;
+                background: #3A4A7A; border-radius: 4px;
             }
         """)
 
     def closeEvent(self, event):
-        """Arrête proprement le thread au fermeture de la fenêtre."""
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(3000)
@@ -896,14 +912,11 @@ class MainWindow(QMainWindow):
 # =============================================================================
 
 def main():
-    """Lance l'application PyQt5."""
     app = QApplication(sys.argv)
-    app.setApplicationName("Pose Model Comparator")
+    app.setApplicationName("Multi-Camera Pose Benchmarker")
     app.setOrganizationName("PFE Master 2")
-
     window = MainWindow()
     window.show()
-
     sys.exit(app.exec_())
 
 

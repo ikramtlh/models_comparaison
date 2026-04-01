@@ -173,8 +173,8 @@ class MetricsAccumulator:
         if mpjpe is not None:
             self.mpjpe_per_frame.append(mpjpe)
 
-        # PCK@0.1 de la frame
-        pck = compute_pck(pred, gt, bbox_size, threshold=0.1)
+        # PCK@0.2 de la frame
+        pck = compute_pck(pred, gt, bbox_size, threshold=0.2)
         if pck is not None:
             self.pck_per_frame.append(pck)
 

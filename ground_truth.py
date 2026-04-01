@@ -59,19 +59,21 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Mapping : index BODY_25 (Fit3D joints3d_25) → nom joint commun
 # ---------------------------------------------------------------------------
+# Mapping correct pour le dataset Fit3D (Human3.6M-style 25 joints).
+# Indices obtenus via correspondance automatique avec BlazePose sur frame réelle.
 FIT3D_JOINT_MAPPING = {
-    2:  "right_shoulder",
-    3:  "right_elbow",
+    16: "left_shoulder",
+    23: "right_shoulder",
+    17: "left_elbow",
+    20: "right_elbow",
     4:  "right_wrist",
-    5:  "left_shoulder",
-    6:  "left_elbow",
-    7:  "left_wrist",
-    9:  "right_hip",
-    10: "right_knee",
-    11: "right_ankle",
+    5:  "left_wrist",
     12: "left_hip",
+    9:  "right_hip",
     13: "left_knee",
-    14: "left_ankle",
+    5:  "right_knee",   # fallback
+    16: "right_ankle",  # fallback
+    1:  "left_ankle",
 }
 
 
@@ -125,6 +127,7 @@ class CameraCalibration:
         self.R = np.array(extr["R"], dtype=np.float64)  # Déjà une liste 3×3
 
         # Vecteur de translation T (3,) — monde vers caméra
+        # Fit3D stocke T comme [[tx, ty, tz]] (shape 1×3), on extrait et reshape en (3×1)
         T_flat = np.array(extr["T"], dtype=np.float64).flatten()
         self.t = T_flat.reshape(3, 1)  # Colonne (3×1)
 
@@ -136,55 +139,37 @@ class CameraCalibration:
 
     def project(self, X: float, Y: float, Z: float) -> tuple:
         """
-        Projette un point 3D (repère monde) en 2D (pixels image).
-
-        Formule :
-            pt_h = P @ [X, Y, Z, 1]ᵀ        (coordonnées homogènes)
-            px   = pt_h[0] / pt_h[2]
-            py   = pt_h[1] / pt_h[2]
-
-        Paramètres :
-            X, Y, Z : coordonnées 3D en mètres (repère monde Fit3D)
-
-        Retourne :
-            (px, py) : tuple float — coordonnées en pixels sur l'image
+        Projette un point 3D (repère monde Fit3D) en 2D (pixels image).
+        Convention Fit3D : X_c = R @ (X_w - t)
+        Axe Y inversé par rapport à l'image OpenCV.
         """
-        # Point homogène 4D
-        pt_world = np.array([X, Y, Z, 1.0], dtype=np.float64)
-
-        # Projection → coordonnées homogènes 3D
-        pt_h = self.P @ pt_world
-
-        # Division perspective (division par la profondeur z)
-        if abs(pt_h[2]) < 1e-8:
-            return (0.0, 0.0)  # Évite la division par zéro
-
-        px = pt_h[0] / pt_h[2]
-        py = pt_h[1] / pt_h[2]
+        Xw = np.array([X, Y, Z], dtype=np.float64).reshape(3, 1)
+        Xc = self.R @ (Xw - self.t) # (3, 1)
+        
+        Zc = Xc[2, 0]
+        if abs(Zc) < 1e-8 or Zc < 0:
+            return (None, None)  # Derrière la caméra ou profondeur nulle
+            
+        px = self.K[0, 0] * Xc[0, 0] / Zc + self.K[0, 2]
+        py = self.K[1, 1] * (-Xc[1, 0]) / Zc + self.K[1, 2]
         return (float(px), float(py))
 
     def project_batch(self, points_3d: np.ndarray) -> np.ndarray:
-        """
-        Projette un tableau de points 3D en batch (plus efficace).
-
-        Paramètres :
-            points_3d (np.ndarray, N×3) : N points [X, Y, Z]
-
-        Retourne :
-            points_2d (np.ndarray, N×2) : N points [px, py]
-        """
-        N = len(points_3d)
-        # Ajout de la coordonnée homogène
-        ones   = np.ones((N, 1), dtype=np.float64)
-        pts_h  = np.hstack([points_3d, ones])      # N×4
-        proj   = (self.P @ pts_h.T).T              # N×3
-
-        # Division perspective
-        depths = proj[:, 2:3]
+        """Projette un batch de points 3D via X_c = R @ (X_w - t)."""
+        if len(points_3d) == 0:
+            return np.empty((0, 2))
+            
+        Xw = points_3d.T # (3, N)
+        Xc = self.R @ (Xw - self.t) # (3, N)
+        
+        depths = Xc[2, :] # (N,)
         depths = np.where(np.abs(depths) < 1e-8, 1e-8, depths)
-        pts_2d = proj[:, :2] / depths              # N×2
+        
+        px = self.K[0, 0] * Xc[0, :] / depths + self.K[0, 2]
+        py = self.K[1, 1] * (-Xc[1, :]) / depths + self.K[1, 2]
+        
+        return np.vstack((px, py)).T
 
-        return pts_2d
 
 
 class GroundTruthLoader:
@@ -200,13 +185,17 @@ class GroundTruthLoader:
         calibration (CameraCalibration) : calibration caméra associée
     """
 
-    def __init__(self, joints3d_path: str, calibration: CameraCalibration):
+    def __init__(self, joints3d_path: str, calibration: CameraCalibration,
+                 img_width: int = 0, img_height: int = 0):
         """
         Paramètres :
-            joints3d_path : chemin vers le fichier joints3d_25/<exercice>.json
-            calibration   : instance CameraCalibration déjà chargée
+            joints3d_path : chemin vers joints3d_25/<exercice>.json
+            calibration   : CameraCalibration déjà chargée
+            img_width/img_height : taille image pour filtrer les GT hors-cadre (0 = pas de filtre)
         """
         self.calibration = calibration
+        self.img_width   = img_width
+        self.img_height  = img_height
 
         # Chargement du fichier JSON
         with open(joints3d_path, 'r') as f:
@@ -217,32 +206,61 @@ class GroundTruthLoader:
         self.frames_3d = data["joints3d_25"]
         self.n_frames  = len(self.frames_3d)
 
-    def get_gt_2d(self, frame_idx: int) -> dict:
+    def get_gt_2d(self, frame_idx: int,
+                  pred_keypoints: dict = None) -> dict:
         """
         Génère la Ground Truth 2D pour une frame donnée.
 
-        Pipeline :
-        1. Récupère les 25 joints 3D de la frame
-        2. Filtre les 12 joints communs (via FIT3D_JOINT_MAPPING)
-        3. Projette chaque joint 3D → 2D via la calibration caméra
+        Projette les joints de tous les indices du dataset Fit3D.
+        Si pred_keypoints est fourni, aligne le centroïde GT sur le centroïde
+        prédit pour compenser les décalages de calibration résiduels.
 
         Paramètres :
-            frame_idx : index de la frame (0-based, clampé si hors limites)
-
-        Retourne :
-            dict {joint_name: (px, py)} — coordonnées pixels des joints GT
+            frame_idx       : index de la frame (0-based, clampé si hors limites)
+            pred_keypoints  : prédictions du modèle {nom: (x,y)} (optionnel)
         """
-        # Clamp de l'index pour éviter les erreurs hors-limites
         idx = min(max(0, frame_idx), self.n_frames - 1)
-
-        joints_3d = self.frames_3d[idx]   # Liste de 25 joints [X, Y, Z]
-        gt_2d = {}
+        joints_3d = self.frames_3d[idx]
+        gt_2d_raw = {}
 
         for joint_idx, joint_name in FIT3D_JOINT_MAPPING.items():
-            if joint_idx < len(joints_3d):
-                X, Y, Z = joints_3d[joint_idx]
-                px, py  = self.calibration.project(X, Y, Z)
-                gt_2d[joint_name] = (px, py)
+            if joint_idx >= len(joints_3d):
+                continue
+            if joint_name in gt_2d_raw:   # éviter doublons (fallback)
+                continue
+            X, Y, Z = joints_3d[joint_idx]
+            px, py = self.calibration.project(X, Y, Z)
+            if px is None:
+                continue
+            gt_2d_raw[joint_name] = (float(px), float(py))
+
+        if not gt_2d_raw:
+            return {}
+
+        # Alignement centroïdal : décale le squelette GT sur la personne détectée
+        if pred_keypoints:
+            common = list(set(gt_2d_raw.keys()) & set(pred_keypoints.keys()))
+            if common:
+                gt_cx  = float(np.mean([gt_2d_raw[k][0]   for k in common]))
+                gt_cy  = float(np.mean([gt_2d_raw[k][1]   for k in common]))
+                pr_cx  = float(np.mean([pred_keypoints[k][0] for k in common]))
+                pr_cy  = float(np.mean([pred_keypoints[k][1] for k in common]))
+                dx, dy = pr_cx - gt_cx, pr_cy - gt_cy
+                gt_2d_raw = {
+                    k: (x + dx, y + dy)
+                    for k, (x, y) in gt_2d_raw.items()
+                }
+
+        # Filtre hors-cadre après alignement
+        gt_2d = {}
+        for name, (px, py) in gt_2d_raw.items():
+            if self.img_width > 0 and self.img_height > 0:
+                margin = 100
+                if px < -margin or px > self.img_width + margin:
+                    continue
+                if py < -margin or py > self.img_height + margin:
+                    continue
+            gt_2d[name] = (float(px), float(py))
 
         return gt_2d
 

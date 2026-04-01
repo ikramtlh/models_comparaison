@@ -28,6 +28,10 @@ import abc
 import time
 import cv2
 import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
 # Noms des 14 joints communs utilisés pour la comparaison
@@ -91,9 +95,10 @@ class PoseEstimator(abc.ABC):
     """
 
     def __init__(self):
+        import typing
         self._fps_history = []   # Historique glissant des FPS
         self._last_time   = None
-        self.color        = (255, 255, 255)  # Blanc par défaut
+        self.color: tuple[int, int, int] = (255, 255, 255)  # Blanc par défaut
 
     @property
     @abc.abstractmethod
@@ -161,15 +166,21 @@ class PoseEstimator(abc.ABC):
         for name, (x, y) in keypoints.items():
             cv2.circle(out, (int(x), int(y)), 5, self.color, -1, cv2.LINE_AA)
 
-        # --- Points Ground Truth (cercles blancs) ---
-        if gt_points:
-            for name, (x, y) in gt_points.items():
-                cv2.circle(out, (int(x), int(y)), 6, (255, 255, 255), 2, cv2.LINE_AA)
+        # --- Points Ground Truth (cercles blancs) — désactivés (mapping Fit3D non documenté) ---
+        # if gt_points:
+        #     for name, (x, y) in gt_points.items():
+        #         cv2.circle(out, (int(x), int(y)), 6, (255, 255, 255), 2, cv2.LINE_AA)
 
-        # --- FPS en haut à gauche ---
+        # --- FPS en haut à gauche (lisible sur n'importe quel fond) ---
         fps_text = f"{self.model_name} | {self.get_fps():.1f} FPS"
-        cv2.putText(out, fps_text, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.color, 2, cv2.LINE_AA)
+        font       = cv2.FONT_HERSHEY_DUPLEX
+        font_scale = 0.75
+        thickness  = 2
+        (tw, th), _ = cv2.getTextSize(fps_text, font, font_scale, thickness)
+        # Fond noir semi-transparent
+        cv2.rectangle(out, (5, 5), (tw + 16, th + 16), (0, 0, 0), -1)
+        cv2.putText(out, fps_text, (10, th + 10),
+                    font, font_scale, self.color, thickness, cv2.LINE_AA)
 
         return out
 
@@ -178,32 +189,9 @@ class PoseEstimator(abc.ABC):
 # ESTIMATEUR 1 : BLAZEPOSE (MediaPipe)
 # =============================================================================
 
+import mediapipe as mp
+
 class BlazePoseEstimator(PoseEstimator):
-    """
-    Estimateur basé sur MediaPipe BlazePose.
-
-    MediaPipe BlazePose détecte 33 landmarks sur le corps entier.
-    On extrait seulement les 12 joints communs via le mapping ci-dessous.
-
-    Mapping BlazePose → joints communs :
-        left_shoulder  → landmark 11
-        right_shoulder → landmark 12
-        left_elbow     → landmark 13
-        right_elbow    → landmark 14
-        left_wrist     → landmark 15
-        right_wrist    → landmark 16
-        left_hip       → landmark 23
-        right_hip      → landmark 24
-        left_knee      → landmark 25
-        right_knee     → landmark 26
-        left_ankle     → landmark 27
-        right_ankle    → landmark 28
-
-    Coordonnées : MediaPipe renvoie des valeurs normalisées [0..1],
-                  multipliées par (width, height) pour obtenir les pixels.
-    """
-
-    # Mapping index MediaPipe → nom joint commun
     BLAZEPOSE_MAPPING = {
         11: "left_shoulder",
         12: "right_shoulder",
@@ -223,46 +211,58 @@ class BlazePoseEstimator(PoseEstimator):
         super().__init__()
         self.color = COLOR_BLAZEPOSE
 
-        # Initialisation du module MediaPipe Pose
+        import os
+        model_path = "pose_landmarker_lite.task"
+        if not os.path.exists(model_path):
+            import urllib.request
+            print(f"[BlazePose] Téléchargement du modèle {model_path}...")
+            url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+            urllib.request.urlretrieve(url, model_path)
+            print("[BlazePose] Téléchargement terminé.")
+
         import mediapipe as mp
-        self._mp_pose = mp.solutions.pose
-        self._pose = self._mp_pose.Pose(
-            static_image_mode=False,       # Mode vidéo (plus rapide)
-            model_complexity=1,            # 0=léger, 1=standard, 2=lourd
-            smooth_landmarks=True,         # Lissage temporel des landmarks
-            min_detection_confidence=0.5,  # Seuil de détection initiale
-            min_tracking_confidence=0.5    # Seuil de suivi entre frames
+        from mediapipe.tasks import python
+        from mediapipe.tasks.python import vision
+
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            output_segmentation_masks=False,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5
         )
+        self._landmarker = vision.PoseLandmarker.create_from_options(options)
 
     @property
     def model_name(self) -> str:
         return "BlazePose"
 
     def _detect_impl(self, frame: np.ndarray) -> dict:
-        """
-        Détecte les joints avec MediaPipe.
-        MediaPipe attend une image RGB, on convertit depuis BGR.
-        """
         h, w = frame.shape[:2]
-
-        # Conversion BGR→RGB requise par MediaPipe
+        import mediapipe as mp
+        
+        # Le landmarker requiert une image RGB (MediaPipe Frame)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self._pose.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        
+        results = self._landmarker.detect(mp_image)
 
         keypoints = {}
-        if results.pose_landmarks:
+        if results.pose_landmarks and len(results.pose_landmarks) > 0:
+            landmarks = results.pose_landmarks[0]
             for idx, name in self.BLAZEPOSE_MAPPING.items():
-                lm = results.pose_landmarks.landmark[idx]
-                # Visibilité < 0.5 → joint probablement hors champ ou occlus
-                if lm.visibility >= 0.5:
-                    keypoints[name] = (lm.x * w, lm.y * h)
+                if idx < len(landmarks):
+                    lm = landmarks[idx]
+                    # Visibilité suffisante
+                    if lm.visibility >= 0.5:
+                        keypoints[name] = (lm.x * w, lm.y * h)
 
         return keypoints
 
     def __del__(self):
-        """Ferme proprement la ressource MediaPipe."""
-        if hasattr(self, '_pose'):
-            self._pose.close()
+        if hasattr(self, '_landmarker'):
+            self._landmarker.close()
 
 
 # =============================================================================
@@ -339,7 +339,9 @@ class YoloPoseEstimator(PoseEstimator):
         best_area = -1
         best_kps  = None
 
-        for r in results:
+        import typing
+        for r_raw in results:
+            r = typing.cast(typing.Any, r_raw)
             if r.keypoints is None:
                 continue
             # Itération sur chaque personne détectée
@@ -399,7 +401,7 @@ class OpenPoseEstimator(PoseEstimator):
     les 2 autres modèles.
     """
 
-    # Mapping index BODY_25 → nom joint commun
+    # Mapping index COCO → nom joint commun
     OPENPOSE_MAPPING = {
         2:  "right_shoulder",
         3:  "right_elbow",
@@ -407,18 +409,18 @@ class OpenPoseEstimator(PoseEstimator):
         5:  "left_shoulder",
         6:  "left_elbow",
         7:  "left_wrist",
-        9:  "right_hip",
-        10: "right_knee",
-        11: "right_ankle",
-        12: "left_hip",
-        13: "left_knee",
-        14: "left_ankle",
+        8:  "right_hip",
+        9:  "right_knee",
+        10: "right_ankle",
+        11: "left_hip",
+        12: "left_knee",
+        13: "left_ankle",
     }
 
-    # Résolution d'entrée du réseau (recommandée pour BODY_25)
+    # Résolution d'entrée du réseau (recommandée pour COCO)
     NET_INPUT_WIDTH  = 368
     NET_INPUT_HEIGHT = 368
-    N_PARTS          = 25   # Nombre de joints dans BODY_25
+    N_PARTS          = 18   # Nombre de joints dans COCO
 
     def __init__(self,
                  proto_path: str = "openpose_models/pose_deploy_linevec.prototxt",
@@ -431,18 +433,21 @@ class OpenPoseEstimator(PoseEstimator):
         super().__init__()
         self.color       = COLOR_OPENPOSE
         self._available  = False
-        self._net        = None
+        import typing
+        self._net: typing.Any = None
 
         try:
             import os
             if not (os.path.exists(proto_path) and os.path.exists(model_path)):
-                raise FileNotFoundError(
-                    f"Fichiers OpenPose introuvables :\n"
+                print(
+                    f"[OpenPose] Fichiers introuvables :\n"
                     f"  Proto : {proto_path}\n"
                     f"  Model : {model_path}\n"
                     f"Téléchargez-les depuis https://github.com/CMU-Perceptual-Computing-Lab/openpose "
                     f"et placez-les dans ./openpose_models/"
                 )
+                self._available = False
+                return
 
             # Chargement du réseau via OpenCV DNN (CPU)
             self._net = cv2.dnn.readNetFromCaffe(proto_path, model_path)
@@ -451,9 +456,9 @@ class OpenPoseEstimator(PoseEstimator):
             self._available = True
             print("[OpenPose] Modèle chargé avec succès.")
 
-        except FileNotFoundError as e:
+        except Exception as e:
             print(f"[OpenPose] AVERTISSEMENT : {e}")
-            print("[OpenPose] L'estimateur retournera toujours un dict vide.")
+            self._available = False
 
     @property
     def model_name(self) -> str:

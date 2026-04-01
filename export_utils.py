@@ -52,7 +52,7 @@ def save_csv(results: dict, fps_data: dict,
         Le chemin absolu du fichier créé.
 
     Format CSV :
-        Modèle,FPS,MPJPE (px),PCK@0.1 (%),Meilleur joint,Pire joint
+        Modèle,FPS,MPJPE (px),Meilleur joint,Pire joint
     """
     abs_path = os.path.abspath(output_path)
 
@@ -62,7 +62,7 @@ def save_csv(results: dict, fps_data: dict,
         # En-tête
         writer.writerow([
             "Modèle", "FPS", "MPJPE (px)", "MPJPE std",
-            "PCK@0.1 (%)", "Meilleur joint", "Pire joint", "Frames évaluées"
+            "Meilleur joint", "Pire joint", "Frames évaluées"
         ])
 
         # Une ligne par modèle
@@ -73,7 +73,6 @@ def save_csv(results: dict, fps_data: dict,
                 f"{fps:.2f}",
                 f"{summary.get('mpjpe_mean', 0):.2f}",
                 f"{summary.get('mpjpe_std', 0):.2f}",
-                f"{summary.get('pck_mean', 0):.2f}",
                 summary.get("best_joint", "N/A"),
                 summary.get("worst_joint", "N/A"),
                 summary.get("n_frames", 0),
@@ -131,7 +130,7 @@ def generate_pdf(results: dict, fps_data: dict, mpjpe_histories: dict,
                  fontsize=20, fontweight='bold', ha='center', va='top',
                  color='#1A237E')
         fig.text(0.5, 0.87,
-                 "Dataset Fit3D | Métriques : MPJPE, PCK@0.1, FPS",
+                 "Dataset Fit3D | Métriques : MPJPE, FPS",
                  fontsize=12, ha='center', va='top', color='#555555')
         fig.text(0.5, 0.83,
                  f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}",
@@ -139,7 +138,7 @@ def generate_pdf(results: dict, fps_data: dict, mpjpe_histories: dict,
                  style='italic')
 
         # Tableau récapitulatif
-        table_data = [["Modèle", "FPS", "MPJPE (px)", "PCK@0.1 (%)",
+        table_data = [["Modèle", "FPS", "MPJPE (px)",
                         "Meilleur joint", "Pire joint"]]
         for m in model_names:
             s   = results[m]
@@ -148,7 +147,6 @@ def generate_pdf(results: dict, fps_data: dict, mpjpe_histories: dict,
                 m,
                 f"{fps:.1f}",
                 f"{s.get('mpjpe_mean',0):.2f} ± {s.get('mpjpe_std',0):.2f}",
-                f"{s.get('pck_mean',0):.1f}%",
                 s.get("best_joint",  "N/A").replace("_", " ").title(),
                 s.get("worst_joint", "N/A").replace("_", " ").title(),
             ])
@@ -229,33 +227,33 @@ def generate_pdf(results: dict, fps_data: dict, mpjpe_histories: dict,
         plt.close(fig)
 
         # -----------------------------------------------------------------
-        # PAGE 4 : Scatter plot Précision × Vitesse
+        # PAGE 4 : Scatter plot Erreur × Vitesse
         # -----------------------------------------------------------------
         fig, ax = plt.subplots(figsize=(11.69, 8.27))
-        pck_vals = [results[m].get("pck_mean", 0) for m in model_names]
+        mpjpe_vals_scatter = [results[m].get("mpjpe_mean", 0) for m in model_names]
 
-        for m, fps_v, pck_v, c in zip(model_names, fps_vals, pck_vals, colors):
-            ax.scatter(fps_v, pck_v, s=300, color=c, zorder=5, label=m)
-            ax.annotate(m, (fps_v, pck_v),
+        for m, fps_v, mpjpe_v, c in zip(model_names, fps_vals, mpjpe_vals_scatter, colors):
+            ax.scatter(fps_v, mpjpe_v, s=300, color=c, zorder=5, label=m)
+            ax.annotate(m, (fps_v, mpjpe_v),
                         textcoords='offset points', xytext=(10, 5),
                         fontsize=12, fontweight='bold', color=c)
 
         ax.set_xlabel("Vitesse (FPS)", fontsize=13)
-        ax.set_ylabel("Précision (PCK@0.1 %)", fontsize=13)
-        ax.set_title("Trade-off Précision / Vitesse", fontsize=16,
+        ax.set_ylabel("Erreur (MPJPE en pixels)", fontsize=13)
+        ax.set_title("Trade-off Erreur / Vitesse", fontsize=16,
                      fontweight='bold', pad=15)
         ax.legend(fontsize=11)
         ax.set_facecolor('#F8F8F8')
         ax.grid(alpha=0.3)
         ax.spines[['top', 'right']].set_visible(False)
 
-        # Zone idéale (haut-droite)
-        ax.annotate("Zone idéale\n(rapide + précis)", xy=(0.85, 0.85),
+        # Zone idéale (bas-droite)
+        ax.annotate("Zone idéale\n(rapide + précis)", xy=(0.85, 0.15),
                     xycoords='axes fraction', fontsize=10,
                     color='#4CAF50', ha='center',
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='#E8F5E9'))
 
-        _add_footnote(fig, "Le modèle idéal est en haut à droite : haute précision ET haute vitesse")
+        _add_footnote(fig, "Le modèle idéal est en bas à droite : faible erreur MPJPE ET haute vitesse FPS")
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
@@ -322,6 +320,75 @@ def generate_pdf(results: dict, fps_data: dict, mpjpe_histories: dict,
             plt.tight_layout()
             pdf.savefig(fig, bbox_inches='tight')
             plt.close(fig)
+
+        # -----------------------------------------------------------------
+        # PAGE 7 : Classement final + Recommandation
+        # -----------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(11.69, 8.27))
+        ax.axis('off')
+
+        fig.text(0.5, 0.96, "Classement Final & Recommandation",
+                 fontsize=18, fontweight='bold', ha='center', va='top',
+                 color='#1A237E')
+        fig.text(0.5, 0.91,
+                 "Synthèse comparative — BlazePose · YOLO-Pose · OpenPose",
+                 fontsize=11, ha='center', va='top', color='#555555',
+                 style='italic')
+
+        medals = ["🥇", "🥈", "🥉"]
+
+        def ranking_block(ax_fig, title, ranked, unit, note, y_top):
+            """Dessine un bloc classement centré."""
+            ax_fig.text(0.5, y_top, title, fontsize=13, fontweight='bold',
+                        ha='center', va='top', color='#1A237E')
+            ax_fig.text(0.5, y_top - 0.04, note, fontsize=8,
+                        ha='center', va='top', color='#777777', style='italic')
+            for rank, (model, val) in enumerate(ranked):
+                color = MODEL_COLORS.get(model, "#888888")
+                line = f"{medals[rank]}  {model}  —  {val:.2f} {unit}"
+                ax_fig.text(0.5, y_top - 0.10 - rank * 0.07, line,
+                            fontsize=12, ha='center', va='top',
+                            color=color, fontweight='bold')
+
+        # --- Classement par FPS (plus grand = meilleur) ---
+        fps_sorted = sorted(model_names, key=lambda m: fps_data.get(m, 0), reverse=True)
+        fps_ranked = [(m, fps_data.get(m, 0)) for m in fps_sorted]
+        ranking_block(fig, "🚀  Classement Vitesse (FPS)", fps_ranked,
+                      "fps", "Plus élevé = meilleur", 0.78)
+
+        # --- Classement par MPJPE (plus petit = meilleur) ---
+        mpjpe_sorted = sorted(model_names, key=lambda m: results[m].get("mpjpe_mean", 9999))
+        mpjpe_ranked = [(m, results[m].get("mpjpe_mean", 0)) for m in mpjpe_sorted]
+        ranking_block(fig, "🎯  Classement Précision (MPJPE)", mpjpe_ranked,
+                      "px", "Plus faible = meilleur", 0.44)
+
+        # --- Score pondéré et recommandation ---
+        # Normalisation : rang FPS + rang MPJPE
+        n = len(model_names)
+        scores = {m: 0 for m in model_names}
+        for rank, (m, _) in enumerate(fps_ranked):
+            scores[m] += (n - rank)        # FPS : poids 1
+        for rank, (m, _) in enumerate(mpjpe_ranked):
+            scores[m] += (n - rank)        # MPJPE : poids 1
+        best = max(scores, key=scores.get)
+        best_color = MODEL_COLORS.get(best, "#1A237E")
+
+        fig.text(0.5, 0.08,
+                 f"✅  Modèle recommandé pour cette application :  {best}",
+                 fontsize=15, fontweight='bold', ha='center', va='bottom',
+                 color='white',
+                 bbox=dict(boxstyle='round,pad=0.6',
+                           facecolor=best_color, alpha=0.9))
+        score_txt = "   |   ".join(
+            [f"{m} : {scores[m]} pt{'s' if scores[m] > 1 else ''}" for m in model_names]
+        )
+        fig.text(0.5, 0.02, f"Score pondéré (FPS + MPJPE) : {score_txt}",
+                 fontsize=8, ha='center', va='bottom',
+                 color='#666666', style='italic')
+
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
 
         # Métadonnées du PDF
         d = pdf.infodict()
